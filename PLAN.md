@@ -28,12 +28,12 @@
 
 ### Technical Summary
 
-Build a Python-based control software for DJI M350 RTK + Manifold 3 (Jetson Orin) that uses Embodied AI (reinforcement learning via PPO) to replace traditional PID control for autonomous building facade inspection and cleaning at target distance d=1.5m. The system subscribes to PSDK telemetry, runs TensorRT-accelerated RL policy inference at 50Hz, and outputs CTBR (Collective Thrust + Body Rates) commands via PSDK Virtual Stick.
+Build a Python-based control software for DJI M350 RTK + Manifold 3 (Jetson Orin) that uses Embodied AI (reinforcement learning via PPO) to replace traditional PID control for autonomous building facade inspection and cleaning at target distance d=1.5m. The system subscribes to PSDK telemetry, runs TensorRT-accelerated RL policy inference, and outputs CTBR (Collective Thrust + Body Rates) commands via PSDK Virtual Stick. CTBR supports up to 400Hz command rate; training uses 50Hz policy (4:1 decimation from 200Hz physics), deployment can scale to 200Hz given ~0.5ms inference latency.
 
 Runtime data pipeline:
 ```
 [PSDK Telemetry] → [Multi-rate Alignment] → [Observation Tensor (23-dim)] → [TensorRT Policy] → [Safety Filter] → [CTBR Command]
-     200Hz              50Hz fusion                                              <10ms               every cycle          50Hz
+     400Hz IMU           50-200Hz fusion                                          <1ms                every cycle       50-200Hz
 ```
 
 ---
@@ -114,7 +114,7 @@ Define the parametric control vectors as frozen dataclasses/pydantic models:
 
 ### Step 1.3 — Configuration (`core/config.py`)
 - Target wall distance: `d_target = 1.5m`
-- Control frequency: 50Hz (configurable 25-50Hz)
+- Control frequency: 50Hz default, configurable up to 200Hz (CTBR supports 400Hz max)
 - Safety thresholds: min wall distance, max tilt, max velocity, geofence box
 - PSDK topic frequencies
 - TensorRT engine path, model input/output dimensions
@@ -152,12 +152,13 @@ ctypes-based wrapper for `libdji_psdk.so`:
 
 ### Step 2.2 — Telemetry Subscriber (`psdk/telemetry.py`)
 - Async subscription manager running in dedicated thread
-- Subscribed topics:
+- Subscribed topics (rates per DJI OSDK documentation):
+  - `TOPIC_ANGULAR_RATE_FUSIONED` @ 400Hz (body angular velocity — highest rate, critical for CTBR)
   - `TOPIC_QUATERNION` @ 200Hz (attitude)
   - `TOPIC_VELOCITY` @ 200Hz (NED velocity)
-  - `TOPIC_GPS_FUSED` / `TOPIC_POSITION_FUSED` @ 50Hz (RTK position)
   - `TOPIC_ACCELERATION_BODY` @ 200Hz (body acceleration)
-  - `TOPIC_ANGULAR_RATE_FUSIONED` @ 200Hz (angular velocity)
+  - `TOPIC_ALTITUDE_BAROMETER` @ 200Hz (barometric altitude)
+  - `TOPIC_GPS_FUSED` / `TOPIC_POSITION_FUSED` @ 50Hz (RTK position)
 - Thread-safe ring buffers per topic with timestamps
 - Provides `get_latest()` and `get_interpolated(timestamp)` accessors
 
@@ -169,9 +170,9 @@ ctypes-based wrapper for `libdji_psdk.so`:
 
 ### Step 2.4 — Data Alignment (`psdk/data_alignment.py`)
 **Research Topic #1: Multi-rate sensor synchronization**
-- Master clock: IMU @ 200Hz drives the alignment cycle
+- Master clock: angular rate @ 400Hz drives the alignment cycle
 - For each control tick:
-  1. Take latest IMU sample (quaternion, angular_vel, accel) — guaranteed fresh
+  1. Take latest IMU samples (angular_vel @ 400Hz, quaternion/accel @ 200Hz) — guaranteed fresh
   2. Look up nearest GPS/RTK sample (50Hz) — linear interpolation if Δt < 20ms, hold if Δt < 40ms, mark stale otherwise
   3. Look up nearest radar/depth sample (10Hz) — hold last valid, mark stale if > 150ms
   4. Look up nearest wind estimate — hold last valid
@@ -189,7 +190,7 @@ ctypes-based wrapper for `libdji_psdk.so`:
   - **Note**: Disabling stable mode removes DJI's internal attitude stabilization — the RL policy provides full attitude control
 - `send_command(thrust_pct, omega_roll, omega_pitch, omega_yaw)` → converts to `T_DjiFlightControllerJoystickCommand` → calls `ExecuteJoystickAction`
 - **Phase 2 validation**: On first boot, confirm `SetJoystickMode()` returns `SUCCESS` with CTBR enums. If rejected, halt and report — velocity fallback to be implemented only if needed.
-- Command rate: 50Hz (CTBR requires consistent high-rate updates)
+- Command rate: 50Hz training / up to 200Hz deployment (CTBR supports 400Hz max per OSDK docs)
 - Minimal command smoothing (latency-sensitive; policy learns smooth outputs via reward shaping)
 - Authority management: obtain on start, release on stop/failsafe
 
@@ -409,6 +410,7 @@ DJI_FLIGHT_CONTROLLER_STABLE_CONTROL_MODE_DISABLE            = 1,  // DJI intern
 - CTBR = direct body-rate + thrust control, bypassing DJI's internal attitude controller
 - This is the consensus best action space for sim-to-real transfer (Swift, SimpleFlight, RAPTOR)
 - Eliminates the complexity of DJI's black-box velocity-to-attitude mapping
+- **Additional advantage**: CTBR supports up to **400Hz** command rate vs velocity's 50Hz (per DJI OSDK docs, Issues [#509](https://github.com/dji-sdk/Onboard-SDK/issues/509), [#456](https://github.com/dji-sdk/Onboard-SDK/issues/456))
 
 **Phase 2 validation** (first priority on-device test):
 1. Call `DjiFlightController_SetJoystickMode()` with CTBR enums
@@ -416,6 +418,109 @@ DJI_FLIGHT_CONTROLLER_STABLE_CONTROL_MODE_DISABLE            = 1,  // DJI intern
 3. If M350 firmware rejects → implement velocity fallback at that point (training is cheap: ~4hrs on RTX 4090)
 
 **Source**: [DJI Payload-SDK dji_flight_controller.h](https://github.com/dji-sdk/Payload-SDK/blob/master/psdk_lib/include/dji_flight_controller.h)
+
+---
+
+## DJI M350 RTK — Platform Parameters
+
+Physical and performance parameters for Isaac Lab simulation and System Identification. Values marked `[EST]` are analytical estimates requiring Phase 3 SysID validation.
+
+### Physical Specifications
+
+| Parameter | Value | Unit | Source |
+|-----------|-------|------|--------|
+| Aircraft (no batteries, no payload) | 3.77 | kg | DJI Official |
+| Single TB65 battery | ~1.35 | kg | DJI Official |
+| Aircraft + 2x TB65 (no payload) | 6.47 | kg | DJI Official |
+| Max payload capacity | 2.73 | kg | Derived |
+| Max takeoff weight (MTOW) | 9.2 | kg | DJI Official |
+| Diagonal wheelbase (motor-to-motor) | 895 | mm | DJI Official |
+| Arm length (center to motor) | ~447.5 | mm | Derived |
+| Unfolded (no props) L×W×H | 810×670×430 | mm | DJI Official |
+| Propeller diameter | 53 (21") | cm | DJI 2110s |
+| Motor count | 4 (X-frame) | — | DJI Official |
+| Motor mounting | Inverted (props below arms) | — | DJI Official |
+
+### Inertia & Propulsion [EST — Requires Phase 3 SysID]
+
+| Parameter | Symbol | Value | Unit | Confidence |
+|-----------|--------|-------|------|------------|
+| Roll inertia | Ixx | 0.12 | kg·m² | Low |
+| Pitch inertia | Iyy | 0.12 | kg·m² | Low |
+| Yaw inertia | Izz | 0.22 | kg·m² | Low |
+| Thrust coefficient | kf | 8.5e-4 | N/(rad/s)² | Low |
+| Torque coefficient | km | 1.1e-5 | N·m/(rad/s)² | Low |
+| km/kf ratio | — | ~0.013 | m | Medium |
+| Motor time constant | τ_m | 0.02 | s | Low |
+| Max thrust per motor | — | ~45 | N | Medium |
+| Total max thrust | — | ~180 | N | Medium |
+| Hover thrust fraction | — | ~35% | — | Medium |
+
+### Flight Envelope (DJI Official)
+
+| Parameter | Value | Unit |
+|-----------|-------|------|
+| Max horizontal speed | 23 (S-mode) / 17 (P-mode) | m/s |
+| Max ascent speed | 6 | m/s |
+| Max descent speed | 5 | m/s |
+| Max tilt angle | 30 | deg |
+| Max angular velocity roll/pitch | 300 | deg/s |
+| Max angular velocity yaw | 100 | deg/s |
+| Max wind resistance | 12 | m/s (Beaufort 6) |
+| Max altitude (standard props) | 5,000 | m |
+| Max flight time (no payload) | 55 | min |
+| Operating temperature | -20 to 50 | °C |
+| IP rating | IP55 | — |
+
+### PSDK/OSDK Control & Telemetry Rates
+
+| Control Mode | Max Command Rate | Note |
+|--------------|-----------------|------|
+| **Angular rate + thrust (CTBR)** | **400 Hz** | **← Our mode** |
+| Attitude (angle) control | 200 Hz | — |
+| Velocity control | 50 Hz | — |
+| Position control | 50 Hz | — |
+
+| Telemetry Topic | Max Rate |
+|----------------|----------|
+| Angular velocity (body frame) | 400 Hz |
+| Quaternion / attitude | 200 Hz |
+| Body acceleration | 200 Hz |
+| Fused velocity | 200 Hz |
+| Barometer altitude | 200 Hz |
+| Fused position (Cartesian) | 50 Hz |
+| Raw GPS/RTK position | 5 Hz |
+
+### Positioning Accuracy
+
+| Mode | Horizontal | Vertical |
+|------|-----------|----------|
+| RTK FIX | 1 cm + 1 ppm | 1.5 cm + 1 ppm |
+| RTK positioning | ±0.1 m | ±0.1 m |
+| GNSS positioning | ±1.5 m | ±0.5 m |
+| Vision positioning | ±0.3 m | ±0.1 m |
+
+### Battery (TB65 ×2)
+
+| Parameter | Value |
+|-----------|-------|
+| Chemistry | Li-ion |
+| Nominal voltage | 44.76 V |
+| Capacity per battery | 5,880 mAh / 263.2 Wh |
+| Total energy (2×TB65) | 526.4 Wh |
+| Hot-swap capable | Yes |
+
+### Parameters Requiring SysID (Phase 3)
+
+| Parameter | Method |
+|-----------|--------|
+| Ixx, Iyy, Izz | Trifilar pendulum or data-driven from flight IMU |
+| kf (thrust coefficient) | Hover calibration: kf = mg / (4·ω²_hover) |
+| km (torque coefficient) | Yaw step-response analysis |
+| Drag coefficients | High-speed flight data regression |
+| CG offset | Physical measurement + flight trim analysis |
+
+**Sources**: [DJI M350 RTK Specs](https://enterprise.dji.com/matrice-350-rtk/specs), [DJI OSDK Flight Controller Docs](https://developer.dji.com/onboard-sdk/documentation/guides/component-guide-flight-control.html), [OSDK Issue #509](https://github.com/dji-sdk/Onboard-SDK/issues/509), [OSDK Issue #456](https://github.com/dji-sdk/Onboard-SDK/issues/456), [OSDK Issue #938 (inertia not disclosed)](https://github.com/dji-sdk/Onboard-SDK/issues/938)
 
 ---
 

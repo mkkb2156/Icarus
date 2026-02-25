@@ -455,14 +455,14 @@ torch.onnx.export(
 ✅ PSDK 成功訂閱 M350 遙測數據 (IMU, GPS, attitude)
 ✅ TensorRT FP16 推理延遲 < 1ms (trtexec benchmark)
 ✅ 端到端管線延遲 < 5ms (觀察構建 + 推理 + safety check)
-✅ Virtual Stick 指令成功發送 (地面靜態測試)
-✅ 50Hz 控制迴路在 Manifold 3 上穩定運行 > 30 分鐘
+✅ CTBR 指令成功發送 (地面靜態測試，確認 M350 接受 body-rate + thrust 模式)
+✅ 50-200Hz CTBR 控制迴路在 Manifold 3 上穩定運行 > 30 分鐘
 ```
 
 ### 2A. PSDK ctypes 封裝 (2 週)
 ```
 psdk/bridge.py          — C → Python 函數封裝
-psdk/telemetry.py       — 非同步遙測訂閱 (200Hz IMU, 50Hz GPS)
+psdk/telemetry.py       — 非同步遙測訂閱 (400Hz angular rate, 200Hz accel/attitude, 50Hz GPS)
 psdk/perception.py      — 毫米波雷達深度訂閱
 psdk/flight_controller.py — CTBR 指令介面 (body-rate + thrust)
 ```
@@ -481,7 +481,7 @@ psdk/flight_controller.py — CTBR 指令介面 (body-rate + thrust)
 
 ### 2B. 多頻率感測器對齊 (1 週)
 ```
-psdk/data_alignment.py  — 200Hz IMU + 50Hz GPS + 10Hz Radar → 50Hz 觀察 Tensor
+psdk/data_alignment.py  — 400Hz angular rate + 200Hz accel/attitude + 50Hz GPS + 10Hz Radar → 50-200Hz 觀察 Tensor
 策略：IMU 為主時鐘，低頻數據最近鄰插值 + 過期標記
 ```
 
@@ -499,9 +499,9 @@ safety/geofence.py      — 3D 操作邊界框
 
 ### 2E. 控制迴路 & 地面測試 (1 週)
 ```
-controller.py           — 50Hz 主迴路 (觀察→推理→安全→指令)
+controller.py           — 50-200Hz CTBR 主迴路 (觀察→推理→安全→CTBR指令)
 main.py                 — 進入點 (CLI, 信號處理, 優雅關機)
-目標：Manifold 3 上跑通完整管線，AI 輸出驗證合理性
+目標：Manifold 3 上跑通完整 CTBR 管線，AI 輸出驗證合理性
 ```
 
 ---
