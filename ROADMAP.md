@@ -19,7 +19,11 @@
 
 ### 關鍵技術發現（影響架構決策）
 
-1. **Action Space**: CTBR (Collective Thrust + Body Rates) 是 sim-to-real 成功率最高的 action space。但因 M350 透過 PSDK 只能發送 velocity 指令（DJI 內部態度控制器為黑箱），我們的 action space 應為 **velocity + yaw rate**（外迴路控制器）。
+1. **Action Space**: CTBR (Collective Thrust + Body Rates) 是 sim-to-real 成功率最高的 action space。~~但因 M350 透過 PSDK 只能發送 velocity 指令（DJI 內部態度控制器為黑箱），我們的 action space 應為 velocity + yaw rate（外迴路控制器）。~~
+   **[2025 更新]** PSDK header `dji_flight_controller.h` 發現 `HORIZONTAL_ANGULAR_RATE_CONTROL_MODE=3` 及 `VERTICAL_THRUST_CONTROL_MODE=2` 枚舉值，表示 CTBR 可能可用。採用**雙模式設計**：
+   - **Velocity mode** (預設安全模式): `[v_x, v_y, v_z, ω_yaw]` — 外迴路控制器
+   - **CTBR mode** (待 Phase 2 驗證): `[thrust, ω_roll, ω_pitch, ω_yaw]` — 直接 body-rate 控制
+   - Phase 2 上機後第一優先驗證 M350 是否接受 CTBR 指令；若不支援則自動退回 velocity mode。
 
 2. **觀察空間修正**: SimpleFlight 研究證實：用 **旋轉矩陣 (9 values)** 取代四元數 (4 values) 作為 actor 輸入能顯著提升 sim-to-real 成功率。PLAN.md 中的觀察向量需相應調整。
 
@@ -32,7 +36,7 @@
 
 4. **推理延遲**: 我們的 MLP `[20]→256→128→64→[4]` (~41K 參數) 在 Orin NX 上 TensorRT FP16 推理延遲約 **0.1-0.5ms**，50Hz (20ms) 預算下有 ~19ms 餘裕。Python 完全可行。
 
-5. **M350 限制**: 無法發送直接馬達 RPM 指令。PSDK 最低層級為 attitude + thrust 或 body-rate。我們的 RL 策略是 DJI 態度控制器上方的 **外迴路控制器**。
+5. **M350 控制層級**: 無法發送直接馬達 RPM 指令。PSDK 最低層級為 body-rate + thrust（CTBR）。PSDK header 定義了 `HORIZONTAL_ANGULAR_RATE_CONTROL_MODE` 及 `VERTICAL_THRUST_CONTROL_MODE` 枚舉，**CTBR 可能可用但需 Phase 2 實機驗證**。若可用，RL 策略可直接輸出 body-rate + thrust（繞過 DJI 內部態度控制器）；若不可用，退回 velocity + yaw rate **外迴路控制器**。
 
 6. **Manifold 3 軟體堆疊**: JetPack 5.1.3 / Ubuntu 20.04 / CUDA 11.4 / TensorRT 8.5。TensorRT 引擎必須在 Manifold 3 上建構。
 
@@ -172,15 +176,24 @@ observation_space = {
 }
 ```
 
-#### 1A.3 動作空間
+#### 1A.3 動作空間（雙模式設計）
 ```python
-# 對應 PSDK Virtual Stick velocity 控制模式
-action_space = {
+# Mode A: Velocity — 對應 PSDK Virtual Stick velocity 控制模式 (安全預設)
+action_space_velocity = {
     "v_x":       (-3.0, 3.0),    # 前後速度 (m/s, body frame)
     "v_y":       (-3.0, 3.0),    # 左右速度 (m/s, body frame)
     "v_z":       (-2.0, 2.0),    # 上下速度 (m/s)
     "omega_yaw": (-1.0, 1.0),    # 偏航角速率 (rad/s)
 }
+
+# Mode B: CTBR — 對應 PSDK body-rate + thrust 模式 (最佳 sim-to-real, 待 Phase 2 驗證)
+action_space_ctbr = {
+    "thrust":      (0.0, 1.0),     # 集合推力 (歸一化 0-100%)
+    "omega_roll":  (-2.6, 2.6),    # 滾轉角速率 (rad/s, ~150 deg/s)
+    "omega_pitch": (-2.6, 2.6),    # 俯仰角速率 (rad/s, ~150 deg/s)
+    "omega_yaw":   (-1.7, 1.7),    # 偏航角速率 (rad/s, ~100 deg/s)
+}
+# 兩種模式都訓練獨立策略；Phase 2 實機測試決定部署哪一個
 ```
 
 #### 1A.4 必要方法實作
@@ -461,7 +474,19 @@ torch.onnx.export(
 psdk/bridge.py          — C → Python 函數封裝
 psdk/telemetry.py       — 非同步遙測訂閱 (200Hz IMU, 50Hz GPS)
 psdk/perception.py      — 毫米波雷達深度訂閱
-psdk/flight_controller.py — Virtual Stick 指令介面
+psdk/flight_controller.py — Virtual Stick 指令介面 (velocity + CTBR 雙模式)
+```
+
+**🔴 Phase 2 第一優先驗證：CTBR 模式可用性**
+```
+在 Manifold 3 上執行：
+1. DjiFlightController_SetJoystickMode() 設定 CTBR 枚舉值
+   - horizontalControlMode = ANGULAR_RATE (3)
+   - verticalControlMode = THRUST (2)
+   - stableMode = DISABLE (1)
+2. 檢查回傳碼是否為 DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS
+3. 若成功 → 啟用 CTBR 策略訓練管線
+4. 若失敗 → 記錄錯誤碼，確認使用 velocity mode
 ```
 
 ### 2B. 多頻率感測器對齊 (1 週)

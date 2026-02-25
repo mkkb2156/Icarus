@@ -106,8 +106,12 @@ Define the parametric control vectors as frozen dataclasses/pydantic models:
 - **EnvironmentVector** `E`: `[distance_to_wall(1), wind_vector_estimate(3)]` → 4 dims
 - **TaskVector** `T`: `[spray_status(1)]` → 1 dim
 - **ObservationTensor** `O = concat(S, E, T)` → 23-dim float32 vector
-- **ActionVector**: `[v_x, v_y, v_z, omega_yaw]` → 4-dim (maps to Virtual Stick)
-- **FlightCommandInterface** — abstract protocol for platform abstraction (DJI PSDK / MAVLink future)
+- **ActionVector** — dual-mode design based on PSDK capability discovery:
+  - **Velocity mode** (safe default): `[v_x, v_y, v_z, omega_yaw]` → 4-dim (maps to Virtual Stick velocity control)
+  - **CTBR mode** (optimal sim-to-real): `[thrust, omega_roll, omega_pitch, omega_yaw]` → 4-dim (collective thrust + body rates)
+  - Mode selection via `core/config.py` — runtime detection validates M350 hardware support
+  - **Rationale**: PSDK `dji_flight_controller.h` defines `DJI_FLIGHT_CONTROLLER_HORIZONTAL_ANGULAR_RATE_CONTROL_MODE = 3` and `DJI_FLIGHT_CONTROLLER_VERTICAL_THRUST_CONTROL_MODE = 2`, indicating CTBR may be available. Phase 2 on-device testing will confirm M350 support; if unavailable, system falls back to velocity mode automatically.
+- **FlightCommandInterface** — abstract protocol for platform abstraction (DJI PSDK / MAVLink future), supports both velocity and CTBR action spaces
 
 ### Step 1.3 — Configuration (`core/config.py`)
 - Target wall distance: `d_target = 1.5m`
@@ -177,15 +181,29 @@ ctypes-based wrapper for `libdji_psdk.so`:
 - Staleness flags propagated to safety layer (degrade to hover if critical data stale)
 
 ### Step 2.5 — Flight Controller Interface (`psdk/flight_controller.py`)
-- Joystick mode configuration:
-  - Horizontal: **velocity control** (body frame)
-  - Vertical: **velocity control**
-  - Yaw: **angular rate** control
+- **Dual joystick mode configuration** (selected via `core/config.py`):
+
+  **Mode A — Velocity (safe default):**
+  - Horizontal: `DJI_FLIGHT_CONTROLLER_HORIZONTAL_VELOCITY_CONTROL_MODE` (body frame)
+  - Vertical: `DJI_FLIGHT_CONTROLLER_VERTICAL_VELOCITY_CONTROL_MODE`
+  - Yaw: `DJI_FLIGHT_CONTROLLER_YAW_ANGLE_RATE_CONTROL_MODE`
   - Coordinate: **body-fixed** frame
-  - Stable mode: **enabled**
-- `send_command(v_x, v_y, v_z, omega_yaw)` → converts to `T_DjiFlightControllerJoystickCommand` → calls `ExecuteJoystickAction`
+  - Stable mode: **enabled** (`DJI_FLIGHT_CONTROLLER_STABLE_CONTROL_MODE_ENABLE`)
+  - Action mapping: `send_command(v_x, v_y, v_z, omega_yaw)`
+
+  **Mode B — CTBR (optimal sim-to-real, requires Phase 2 hardware validation):**
+  - Horizontal: `DJI_FLIGHT_CONTROLLER_HORIZONTAL_ANGULAR_RATE_CONTROL_MODE` (enum=3)
+  - Vertical: `DJI_FLIGHT_CONTROLLER_VERTICAL_THRUST_CONTROL_MODE` (enum=2)
+  - Yaw: `DJI_FLIGHT_CONTROLLER_YAW_ANGLE_RATE_CONTROL_MODE` (enum=1)
+  - Coordinate: **body-fixed** frame
+  - Stable mode: **disabled** (`DJI_FLIGHT_CONTROLLER_STABLE_CONTROL_MODE_DISABLE`, enum=0)
+  - Action mapping: `send_command(thrust_pct, omega_roll, omega_pitch, omega_yaw)`
+  - **Note**: Disabling stable mode removes DJI's internal attitude stabilization — the RL policy must provide full attitude control
+
+- **Runtime mode detection**: On initialization, attempt to set CTBR mode and verify via readback. If M350 firmware rejects the mode, log warning and fall back to velocity mode.
+- Converts `ActionVector` to `T_DjiFlightControllerJoystickCommand` → calls `ExecuteJoystickAction`
 - Command rate: 25-50Hz (configurable)
-- Command smoothing: exponential moving average filter
+- Command smoothing: exponential moving average filter (velocity mode); minimal smoothing for CTBR (latency-sensitive)
 - Authority management: obtain on start, release on stop/failsafe
 
 ---
@@ -202,14 +220,23 @@ ctypes-based wrapper for `libdji_psdk.so`:
 
 ### Step 3.2 — Policy Wrapper (`inference/policy.py`)
 - Observation normalization: running mean/std from training (loaded from checkpoint)
-- Input: `ObservationTensor(20)` → normalize → TensorRT inference → `ActionVector(4)`
-- Action post-processing:
-  - Clip to physical limits: `v_x ∈ [-3, 3] m/s`, `v_y ∈ [-3, 3] m/s`, `v_z ∈ [-2, 2] m/s`, `ω_yaw ∈ [-60, 60] deg/s`
+- Input: `ObservationTensor(23)` → normalize → TensorRT inference → `ActionVector(4)`
+- **Action post-processing (mode-dependent)**:
+
+  **Velocity mode limits:**
+  - `v_x ∈ [-3, 3] m/s`, `v_y ∈ [-3, 3] m/s`, `v_z ∈ [-2, 2] m/s`, `ω_yaw ∈ [-60, 60] deg/s`
   - Apply exponential smoothing between consecutive actions
+
+  **CTBR mode limits:**
+  - `thrust ∈ [0, 100] %` (collective thrust percentage)
+  - `ω_roll ∈ [-150, 150] deg/s`, `ω_pitch ∈ [-150, 150] deg/s`, `ω_yaw ∈ [-100, 100] deg/s`
+  - Minimal smoothing only (CTBR is latency-sensitive; the policy must learn smooth outputs via reward shaping)
+
 - Backend abstraction:
   - `TensorRTPolicy` — production (Jetson)
   - `TorchPolicy` — development/debugging
   - `DummyPolicy` — testing (returns zero commands)
+- **Note**: Velocity and CTBR policies are separate trained models with different action semantics. The config specifies which model to load.
 
 ---
 
@@ -259,7 +286,9 @@ ctypes-based wrapper for `libdji_psdk.so`:
 - Wall model: flat vertical surface, configurable dimensions
 - Target following distance: `d = 1.5m` from wall
 - Observation space (20-dim): `O = [dist_to_wall, velocity(3), acceleration(3), orientation(4), angular_vel(3), wind_est(3), spray_status(1), target_offset(2)]`
-- Action space (4-dim continuous): `a = [v_x, v_y, v_z, ω_yaw]` — maps directly to Virtual Stick
+- Action space (4-dim continuous, mode-dependent):
+  - **Velocity mode**: `a = [v_x, v_y, v_z, ω_yaw]` — maps to Virtual Stick velocity control
+  - **CTBR mode**: `a = [thrust, ω_roll, ω_pitch, ω_yaw]` — maps to collective thrust + body angular rates (preferred for sim-to-real per Swift/SimpleFlight research; requires Phase 2 M350 hardware validation)
 - Physics step: 200Hz, policy step: 50Hz (4:1 decimation ratio)
 - Episode termination: crash (d < 0.1m), drift (d > 5m), timeout (60s)
 
@@ -376,6 +405,44 @@ while running:
 - The trained RL model never touches platform-specific APIs — it only sees `ObservationTensor` and outputs `ActionVector`
 
 This ensures the "intelligence" is decoupled from the "airframe", enabling the vision of selling portable flight AI.
+
+---
+
+## Research Topic #5: PSDK CTBR Control Mode Discovery
+
+**Discovery**: DJI PSDK header `dji_flight_controller.h` defines control mode enums that suggest CTBR (Collective Thrust + Body Rates) may be available on M350 RTK:
+
+```c
+// Horizontal control modes (T_DjiFlightControllerHorizontalControlMode)
+DJI_FLIGHT_CONTROLLER_HORIZONTAL_VELOCITY_CONTROL_MODE       = 0,  // velocity (current implementation)
+DJI_FLIGHT_CONTROLLER_HORIZONTAL_POSITION_CONTROL_MODE       = 1,  // position
+DJI_FLIGHT_CONTROLLER_HORIZONTAL_ANGULAR_RATE_CONTROL_MODE   = 3,  // body angular rates ← CTBR
+
+// Vertical control modes (T_DjiFlightControllerVerticalControlMode)
+DJI_FLIGHT_CONTROLLER_VERTICAL_VELOCITY_CONTROL_MODE         = 0,  // velocity (current implementation)
+DJI_FLIGHT_CONTROLLER_VERTICAL_POSITION_CONTROL_MODE         = 1,  // position/altitude
+DJI_FLIGHT_CONTROLLER_VERTICAL_THRUST_CONTROL_MODE           = 2,  // thrust percentage ← CTBR
+
+// Stable mode (T_DjiFlightControllerStableMode)
+DJI_FLIGHT_CONTROLLER_STABLE_CONTROL_MODE_ENABLE             = 0,  // DJI internal stabilization ON
+DJI_FLIGHT_CONTROLLER_STABLE_CONTROL_MODE_DISABLE            = 1,  // DJI internal stabilization OFF ← required for CTBR
+```
+
+**Significance**: If CTBR is supported on M350, this fundamentally changes our control architecture:
+- **Velocity mode** = outer-loop controller on top of DJI black-box attitude controller (current design)
+- **CTBR mode** = direct body-rate + thrust control, bypassing DJI's internal controller — this is the preferred action space for sim-to-real transfer (per Swift, SimpleFlight, RAPTOR research)
+
+**Validation plan** (Phase 2 priority):
+1. On Manifold 3, call `DjiFlightController_SetJoystickMode()` with CTBR enum values
+2. Check return code — `DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS` confirms support
+3. If supported: train both velocity and CTBR policies, compare sim-to-real transfer quality
+4. If rejected by firmware: fall back to velocity mode (no wasted effort — velocity pipeline already works)
+
+**Impact on training**: If CTBR confirmed, train two parallel policies in Isaac Lab:
+- Velocity policy: `[v_x, v_y, v_z, ω_yaw]` — safe fallback, always available
+- CTBR policy: `[thrust, ω_roll, ω_pitch, ω_yaw]` — expected to have better sim-to-real transfer, lower tracking error
+
+**Source**: [DJI Payload-SDK dji_flight_controller.h](https://github.com/dji-sdk/Payload-SDK/blob/master/psdk_lib/include/dji_flight_controller.h)
 
 ---
 
