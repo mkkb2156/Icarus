@@ -71,7 +71,7 @@ st.markdown("""
 │  System ID: mass, inertia, thrust curves, drag coefficients         │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Edge Execution Layer  (Manifold 3 / Jetson Orin)                   │
-│  TensorRT FP16 inference <1ms, PSDK CTBR output at 50-200Hz        │
+│  TensorRT FP16 inference <1ms, PSDK rate+thrust setpoints 50-200Hz │
 │  Safety failsafe: NORMAL → CAUTION → OVERRIDE → EMERGENCY          │
 └─────────────────────────────────────────────────────────────────────┘
 ```

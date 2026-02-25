@@ -2,7 +2,7 @@
 
 Aligned with PLAN.md and ROADMAP.md Phase 1 specifications:
 - 23-dim observation space (rotation matrix, not quaternion — per SimpleFlight)
-- 4-dim CTBR action space [thrust, omega_roll, omega_pitch, omega_yaw]
+- 4-dim angular rate + thrust action space [thrust, omega_roll, omega_pitch, omega_yaw]
 - 200Hz physics / 50Hz policy (decimation=4)
 - Target wall distance: 1.5m
 - 4096 parallel environments
@@ -100,7 +100,7 @@ class FacadeDroneEnvCfg(DirectRLEnvCfg):
     wall_position_x: float = 0.0  # x-coordinate of wall surface
 
     # --- Action scaling ---
-    # CTBR action bounds (policy outputs normalized [-1, 1], we scale)
+    # Angular rate + thrust action bounds (policy outputs normalized [-1, 1], we scale)
     thrust_to_weight: float = 1.9  # max thrust as multiple of hover thrust
     moment_scale: float = 0.02  # Nm per unit action for body rates
 

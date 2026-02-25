@@ -21,19 +21,19 @@
 ```
 [Virtual Evolution Layer] (Cloud/GPU)     → Isaac Lab: 4096 parallel drones, domain randomization, PPO training
 [Data Alignment Layer]   (Sim-to-Real)    → 50hrs real flight data calibrates simulator constants
-[Edge Execution Layer]   (Manifold 3)     → TensorRT FP16 inference < 10ms, PSDK CTBR output
+[Edge Execution Layer]   (Manifold 3)     → TensorRT FP16 inference < 10ms, PSDK angular-rate + thrust output (DJI safety arbiter retained)
 ```
 
 ---
 
 ### Technical Summary
 
-Build a Python-based control software for DJI M350 RTK + Manifold 3 (Jetson Orin) that uses Embodied AI (reinforcement learning via PPO) to replace traditional PID control for autonomous building facade inspection and cleaning at target distance d=1.5m. The system subscribes to PSDK telemetry, runs TensorRT-accelerated RL policy inference, and outputs CTBR (Collective Thrust + Body Rates) commands via PSDK Virtual Stick. CTBR supports up to 400Hz command rate; training uses 50Hz policy (4:1 decimation from 200Hz physics), deployment can scale to 200Hz given ~0.5ms inference latency.
+Build a Python-based control software for DJI M350 RTK + Manifold 3 (Jetson Orin) that uses Embodied AI (reinforcement learning via PPO) to replace traditional PID control for autonomous building facade inspection and cleaning at target distance d=1.5m. The system subscribes to PSDK telemetry, runs TensorRT-accelerated RL policy inference, and outputs angular-rate + thrust setpoints via PSDK Virtual Stick joystick interface. DJI's safety arbiter (authority management, motor mixing, failsafe) remains active at all times — the RL policy provides high-frequency outer-loop setpoints, not raw motor access. Angular rate + thrust mode supports up to 400Hz command rate; training uses 50Hz policy (4:1 decimation from 200Hz physics), deployment can scale to 200Hz given ~0.5ms inference latency.
 
 Runtime data pipeline:
 ```
-[PSDK Telemetry] → [Multi-rate Alignment] → [Observation Tensor (23-dim)] → [TensorRT Policy] → [Safety Filter] → [CTBR Command]
-     400Hz IMU           50-200Hz fusion                                          <1ms                every cycle       50-200Hz
+[PSDK Telemetry] → [Multi-rate Alignment] → [Observation Tensor (23-dim)] → [TensorRT Policy] → [Safety Filter] → [Rate+Thrust Setpoint] → [DJI Safety Arbiter]
+     400Hz IMU           50-200Hz fusion                                          <1ms                every cycle       50-200Hz              (always active)
 ```
 
 ---
@@ -106,10 +106,11 @@ Define the parametric control vectors as frozen dataclasses/pydantic models:
 - **EnvironmentVector** `E`: `[distance_to_wall(1), wind_vector_estimate(3)]` → 4 dims
 - **TaskVector** `T`: `[spray_status(1)]` → 1 dim
 - **ObservationTensor** `O = concat(S, E, T)` → 23-dim float32 vector
-- **ActionVector**: `[thrust, omega_roll, omega_pitch, omega_yaw]` → 4-dim CTBR (Collective Thrust + Body Rates)
-  - PSDK `dji_flight_controller.h` defines `HORIZONTAL_ANGULAR_RATE_CONTROL_MODE = 3`, `VERTICAL_THRUST_CONTROL_MODE = 2`, `STABLE_CONTROL_MODE_DISABLE = 1`
-  - CTBR is the consensus best action space for sim-to-real transfer (Swift, SimpleFlight, RAPTOR)
-  - Phase 2 on-device validation required; if M350 firmware rejects CTBR, add velocity fallback at that point
+- **ActionVector**: `[thrust, omega_roll, omega_pitch, omega_yaw]` → 4-dim angular rate + thrust setpoints
+  - PSDK `dji_flight_controller.h` mode combination: `HORIZONTAL_ANGULAR_RATE_CONTROL_MODE` + `VERTICAL_THRUST_CONTROL_MODE` + `YAW_ANGLE_RATE_CONTROL_MODE` in `HORIZONTAL_BODY_COORDINATE` (body/FRU frame)
+  - Angular rate + thrust is the consensus best action space for sim-to-real transfer (Swift, SimpleFlight, RAPTOR)
+  - **Important nuance**: This is high-frequency outer-loop setpoint control. DJI's safety arbiter (motor mixing, ESC, authority management, failsafe) remains active. The RL policy provides outer-loop + semi-inner-loop setpoints; DJI handles motor-level control and safety enforcement.
+  - Phase 2 on-device validation required: (a) confirm mode acceptance, (b) measure actual command rate and latency, (c) characterize authority takeover boundaries
 - **FlightCommandInterface** — abstract protocol for platform abstraction (DJI PSDK / MAVLink future)
 
 ### Step 1.3 — Configuration (`core/config.py`)
@@ -181,18 +182,25 @@ ctypes-based wrapper for `libdji_psdk.so`:
 - Staleness flags propagated to safety layer (degrade to hover if critical data stale)
 
 ### Step 2.5 — Flight Controller Interface (`psdk/flight_controller.py`)
-- **CTBR joystick mode configuration**:
+- **Joystick mode configuration (angular rate + thrust)**:
   - Horizontal: `DJI_FLIGHT_CONTROLLER_HORIZONTAL_ANGULAR_RATE_CONTROL_MODE` (enum=3)
   - Vertical: `DJI_FLIGHT_CONTROLLER_VERTICAL_THRUST_CONTROL_MODE` (enum=2)
   - Yaw: `DJI_FLIGHT_CONTROLLER_YAW_ANGLE_RATE_CONTROL_MODE` (enum=1)
-  - Coordinate: **body-fixed** frame
+  - Coordinate: `HORIZONTAL_BODY_COORDINATE` (body/FRU frame)
   - Stable mode: **disabled** (`DJI_FLIGHT_CONTROLLER_STABLE_CONTROL_MODE_DISABLE`, enum=0)
-  - **Note**: Disabling stable mode removes DJI's internal attitude stabilization — the RL policy provides full attitude control
+  - **Note**: Disabling stable mode removes DJI's attitude-level stabilization loop, allowing the RL policy to set angular-rate + thrust setpoints directly. However, DJI's safety arbiter (motor mixing, ESC protection, authority management, failsafe triggers) remains active at all times. This is outer-loop + semi-inner-loop setpoint control, not raw motor access. The retained safety layer is a commercial advantage for regulatory compliance and customer risk assurance.
 - `send_command(thrust_pct, omega_roll, omega_pitch, omega_yaw)` → converts to `T_DjiFlightControllerJoystickCommand` → calls `ExecuteJoystickAction`
-- **Phase 2 validation**: On first boot, confirm `SetJoystickMode()` returns `SUCCESS` with CTBR enums. If rejected, halt and report — velocity fallback to be implemented only if needed.
-- Command rate: 50Hz training / up to 200Hz deployment (CTBR supports 400Hz max per OSDK docs)
+- **Authority management (critical for deployment)**:
+  - Must first obtain joystick authority via `ObtainJoystickCtrlAuthority()`
+  - Authority can be forcibly returned to RC under multiple conditions: RC not in P mode, RC pause button, low battery go-home/landing, PSDK disconnection, approaching flight boundaries
+  - Design for graceful degradation: monitor authority state, handle takeover events, resume when authority returns
+  - Release authority on stop/failsafe
+- **Phase 2 validation** (3 concrete test objectives):
+  1. **Command rate & latency**: Can we sustain 20-50Hz (or at least 10-20Hz) joystick commands? Measure end-to-end latency from policy output to motor response.
+  2. **Mode availability constraints**: GPS/health flags, visual system conditions; in water mist/reflection scenarios, which modes degrade?
+  3. **Authority takeover boundaries**: Map all conditions under which RC/low-battery/boundary events seize control. Design graceful degradation protocol.
+- Command rate: 50Hz training / up to 200Hz deployment (angular rate + thrust supports 400Hz max per OSDK docs)
 - Minimal command smoothing (latency-sensitive; policy learns smooth outputs via reward shaping)
-- Authority management: obtain on start, release on stop/failsafe
 
 ---
 
@@ -386,36 +394,72 @@ This ensures the "intelligence" is decoupled from the "airframe", enabling the v
 
 ---
 
-## Research Topic #5: PSDK CTBR Control Mode
+## Research Topic #5: PSDK Angular Rate + Thrust Control Mode
 
-**Discovery**: DJI PSDK header `dji_flight_controller.h` defines control mode enums enabling CTBR (Collective Thrust + Body Rates) on PSDK-connected drones:
+**Discovery**: DJI PSDK header `dji_flight_controller.h` defines control mode enums enabling angular-rate + thrust setpoint control on PSDK-connected drones. The recommended mode combination for RL policy deployment:
 
 ```c
 // Horizontal control modes (T_DjiFlightControllerHorizontalControlMode)
 DJI_FLIGHT_CONTROLLER_HORIZONTAL_VELOCITY_CONTROL_MODE       = 0,
 DJI_FLIGHT_CONTROLLER_HORIZONTAL_POSITION_CONTROL_MODE       = 1,
-DJI_FLIGHT_CONTROLLER_HORIZONTAL_ANGULAR_RATE_CONTROL_MODE   = 3,  // ← body angular rates
+DJI_FLIGHT_CONTROLLER_HORIZONTAL_ANGULAR_RATE_CONTROL_MODE   = 3,  // ← body angular rates (±150 deg/s)
 
 // Vertical control modes (T_DjiFlightControllerVerticalControlMode)
 DJI_FLIGHT_CONTROLLER_VERTICAL_VELOCITY_CONTROL_MODE         = 0,
 DJI_FLIGHT_CONTROLLER_VERTICAL_POSITION_CONTROL_MODE         = 1,
-DJI_FLIGHT_CONTROLLER_VERTICAL_THRUST_CONTROL_MODE           = 2,  // ← thrust percentage
+DJI_FLIGHT_CONTROLLER_VERTICAL_THRUST_CONTROL_MODE           = 2,  // ← thrust percentage (0-100%)
+
+// Yaw control modes (T_DjiFlightControllerYawControlMode)
+DJI_FLIGHT_CONTROLLER_YAW_ANGLE_CONTROL_MODE                 = 0,
+DJI_FLIGHT_CONTROLLER_YAW_ANGLE_RATE_CONTROL_MODE            = 1,  // ← yaw rate (±150 deg/s)
+
+// Coordinate system
+DJI_FLIGHT_CONTROLLER_HORIZONTAL_GROUND_COORDINATE            = 0,  // NEU (ground)
+DJI_FLIGHT_CONTROLLER_HORIZONTAL_BODY_COORDINATE               = 1,  // FRU (body frame) ← our choice
 
 // Stable mode (T_DjiFlightControllerStableMode)
-DJI_FLIGHT_CONTROLLER_STABLE_CONTROL_MODE_ENABLE             = 0,  // DJI internal stabilization ON
-DJI_FLIGHT_CONTROLLER_STABLE_CONTROL_MODE_DISABLE            = 1,  // DJI internal stabilization OFF
+DJI_FLIGHT_CONTROLLER_STABLE_CONTROL_MODE_ENABLE             = 0,  // DJI attitude stabilization ON
+DJI_FLIGHT_CONTROLLER_STABLE_CONTROL_MODE_DISABLE            = 1,  // DJI attitude stabilization OFF
 ```
 
-**Architecture decision**: Use CTBR as sole action space. No velocity fallback in initial implementation.
-- CTBR = direct body-rate + thrust control, bypassing DJI's internal attitude controller
-- This is the consensus best action space for sim-to-real transfer (Swift, SimpleFlight, RAPTOR)
-- Eliminates the complexity of DJI's black-box velocity-to-attitude mapping
-- **Additional advantage**: CTBR supports up to **400Hz** command rate vs velocity's 50Hz (per DJI OSDK docs, Issues [#509](https://github.com/dji-sdk/Onboard-SDK/issues/509), [#456](https://github.com/dji-sdk/Onboard-SDK/issues/456))
+**Corrected understanding (updated based on PSDK header research)**:
 
-**Phase 2 validation** (first priority on-device test):
-1. Call `DjiFlightController_SetJoystickMode()` with CTBR enums
-2. Confirm `DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS`
-3. If M350 firmware rejects → implement velocity fallback at that point (training is cheap: ~4hrs on RTX 4090)
+The earlier framing "CTBR bypasses DJI's internal attitude controller" was **inaccurate**. The correct 3-layer model:
+
+| Layer | Who controls | What it does |
+|-------|-------------|--------------|
+| **Outer-loop** (our RL policy) | AI @ 20-50Hz+ | Angular-rate setpoints (roll/pitch/yaw rates) + thrust percentage. With stable mode disabled, DJI's attitude-level PID is out of the loop, but the policy still issues *setpoints* that DJI's lower layers execute. |
+| **Safety arbiter** (DJI, always-on) | DJI firmware | Motor mixing (setpoint → individual motor RPM), ESC protection, joystick authority management, failsafe triggers (low battery, geofence, RC pause, PSDK disconnect). Cannot be disabled. |
+| **True inner-loop** (DJI, black box) | DJI ESC | Motor mixing matrix, ESC-level control. Not accessible via any API. For commercial operations, this is correct — you should not touch it. |
+
+**Correct framing**: "AI controls outer-loop, DJI keeps inner-loop stability + failsafe"
+- RL policy outputs high-frequency angular-rate + thrust setpoints
+- DJI executes these setpoints through its motor mixing and ESC layer
+- DJI's safety arbiter can seize control at any time (RC takeover, low battery, geofence)
+- This retained safety layer is a **commercial advantage**: regulatory compliance, customer risk assurance, operational insurance
+
+**Architecture decision**: Use angular-rate + thrust as sole action space. No velocity fallback in initial implementation.
+- Angular rate + thrust is the consensus best action space for sim-to-real transfer (Swift, SimpleFlight, RAPTOR)
+- Eliminates the complexity of DJI's velocity-to-attitude mapping (which adds unpredictable intermediate dynamics)
+- **Additional advantage**: Supports up to **400Hz** command rate vs velocity's 50Hz (per DJI OSDK docs, Issues [#509](https://github.com/dji-sdk/Onboard-SDK/issues/509), [#456](https://github.com/dji-sdk/Onboard-SDK/issues/456))
+
+**DJI Joystick Authority Model**:
+- Must first obtain joystick authority (`ObtainJoystickCtrlAuthority`)
+- Authority source is switchable: RC / MSDK / Internal / OSDK
+- Authority can be **forcibly returned to RC** under:
+  - RC not in P mode
+  - RC pause button pressed
+  - Low battery triggering go-home or landing
+  - PSDK disconnection
+  - Approaching DJI flight boundaries
+- This is a feature, not a limitation — it provides the operational safety net required for commercial facade operations
+
+**Phase 2 validation** (3 critical test objectives):
+1. **Command rate & latency**: Call `SetJoystickMode()` with angular-rate + thrust enums. Confirm acceptance. Measure sustainable command rate (target: 20-50Hz, minimum: 10-20Hz). Measure end-to-end latency from PSDK command to measurable motor response.
+2. **Mode availability constraints**: Test under water mist / reflective surface conditions. Determine which GPS/health flags or visual system states affect mode availability. Map the "degraded mode" landscape.
+3. **Authority takeover boundaries**: Systematically trigger all takeover conditions (RC pause, low battery, geofence approach). Measure transition timing. Design graceful degradation protocol: detect authority loss → safe hover command → resume on authority return.
+
+If mode is rejected by firmware → implement velocity fallback (training is cheap: ~4hrs on RTX 4090).
 
 **Source**: [DJI Payload-SDK dji_flight_controller.h](https://github.com/dji-sdk/Payload-SDK/blob/master/psdk_lib/include/dji_flight_controller.h)
 

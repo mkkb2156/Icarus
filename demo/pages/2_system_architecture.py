@@ -49,7 +49,7 @@ with col3:
     **Hardware**: DJI Manifold 3 (Jetson Orin)
 
     - TensorRT FP16 inference: **<1ms**
-    - PSDK CTBR control: up to **400Hz**
+    - PSDK angular rate + thrust: up to **400Hz**
     - Multi-rate sensor fusion:
       - IMU: 400Hz
       - Attitude: 200Hz
@@ -65,8 +65,8 @@ st.markdown("---")
 st.header("Runtime Data Pipeline")
 
 st.code("""
-[PSDK Telemetry] → [Multi-rate Alignment] → [Observation (23-dim)] → [TensorRT Policy] → [Safety Filter] → [CTBR Command]
-     400Hz IMU         50-200Hz fusion                                       <1ms              every cycle       50-200Hz
+[PSDK Telemetry] → [Multi-rate Alignment] → [Observation (23-dim)] → [TensorRT Policy] → [Safety Filter] → [Rate+Thrust Setpoint] → [DJI Safety Arbiter]
+     400Hz IMU         50-200Hz fusion                                       <1ms              every cycle       50-200Hz              (always active)
 """, language="text")
 
 st.markdown("---")
@@ -107,23 +107,25 @@ with col2:
 
 st.markdown("---")
 
-# ─── CTBR Control Mode ───────────────────────────────────────────────
+# ─── Angular Rate + Thrust Control ───────────────────────────────────
 
-st.header("CTBR: Direct Body-Rate Control")
+st.header("Angular Rate + Thrust: High-Frequency Outer-Loop Control")
 
 st.markdown("""
-**Why CTBR over traditional velocity/position control?**
+**Why angular rate + thrust over traditional velocity/position control?**
 
-| Feature | Velocity Control | CTBR (Our Approach) |
-|---------|-----------------|---------------------|
-| Command rate | 50 Hz | **400 Hz** |
-| DJI internal PID | Active (black box) | **Bypassed** |
-| Reaction time | ~100ms | **<5ms** |
-| Disturbance handling | Reactive | **Proactive** (learned) |
-| Sim-to-real gap | Large (hidden dynamics) | **Minimal** (direct control) |
+| Feature | Velocity Control | Angular Rate + Thrust (Our Approach) |
+|---------|-----------------|--------------------------------------|
+| Command rate | 50 Hz | **Up to 400 Hz** |
+| DJI attitude PID | Active (adds hidden dynamics) | **Disabled** (policy sets rate targets directly) |
+| DJI safety arbiter | Active | **Active** (motor mixing, failsafe, authority — retained as commercial safety feature) |
+| Disturbance handling | Reactive (DJI PID response) | **Proactive** (learned compensation) |
+| Sim-to-real gap | Large (hidden intermediate dynamics) | **Reduced** (fewer abstraction layers between policy and motors) |
 
-The RL policy outputs `[thrust, ω_roll, ω_pitch, ω_yaw]` directly — the same
+The RL policy outputs `[thrust, ω_roll, ω_pitch, ω_yaw]` as setpoints — the same
 representation used by championship-winning drone racing AI (Swift, Nature 2023).
+DJI's safety layer (motor mixing, failsafe, RC authority) remains active at all times,
+providing the operational safety net required for commercial facade operations.
 """)
 
 st.markdown("---")
@@ -137,7 +139,7 @@ Icarus is built on peer-reviewed, state-of-the-art research:
 
 | Reference | Source | Key Contribution |
 |-----------|--------|-----------------|
-| **Swift** | UZH, *Nature* 2023 | Champion drone racing AI — CTBR action space, non-parametric noise model |
+| **Swift** | UZH, *Nature* 2023 | Champion drone racing AI — angular rate + thrust action space, non-parametric noise model |
 | **SimpleFlight** | Tsinghua, *IEEE RA-L* 2024 | 5 key factors for zero-shot sim-to-real: rotation matrix input, action smoothness penalty |
 | **RAPTOR** | rl-tools, 2025 | 2,084-param GRU controlling 10 different drones — meta-imitation learning |
 | **Aerial Gym** | NTNU, *IEEE RA-L* 2025 | GPU-parallel MAV simulation — Isaac Gym architecture template |
@@ -153,7 +155,7 @@ st.header("Product Roadmap")
 phases = [
     ("Phase 0", "Environment Setup", "2-3 weeks", "Completed", "Isaac Lab validated, baseline trained"),
     ("Phase 1", "Virtual Training", "6-8 weeks", "Completed", "4096-env training, ONNX export, demo dashboard"),
-    ("Phase 2", "PSDK Integration", "4-6 weeks", "Next", "Manifold 3 inference, CTBR validation, safety system"),
+    ("Phase 2", "PSDK Integration", "4-6 weeks", "Next", "Manifold 3 inference, angular rate + thrust validation, safety system"),
     ("Phase 3", "Sim-to-Real", "4-6 weeks", "Planned", "System ID, shadow testing, policy v2"),
     ("Phase 4", "Autonomous Flight", "4-6 weeks", "Planned", "AI maintains d=1.5m for 5+ min, spray mode"),
     ("Phase 5", "Product Features", "8-12 weeks", "Planned", "Path planning, multi-drone, mission reporting"),

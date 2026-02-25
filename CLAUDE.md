@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Icarus is an Embodied AI drone system for autonomous facade operations (cleaning/inspection). RL policies are trained in NVIDIA Isaac Lab (GPU-parallel simulation), exported to ONNX/TensorRT, and deployed on DJI M350 RTK drones via PSDK CTBR control. Currently in Phase 1 (virtual environment training).
+Icarus is an Embodied AI drone system for autonomous facade operations (cleaning/inspection). RL policies are trained in NVIDIA Isaac Lab (GPU-parallel simulation), exported to ONNX/TensorRT, and deployed on DJI M350 RTK drones via PSDK angular-rate + thrust control (high-frequency outer-loop setpoints with DJI safety arbiter retained). Currently in Phase 1 (virtual environment training).
 
 ## Architecture
 
@@ -33,7 +33,7 @@ Key docs: `PLAN.md` (full technical spec, zh-TW), `ROADMAP.md` (5-phase product 
 
 ## Key Technical Decisions
 
-- **Action space**: CTBR `[thrust, omega_roll, omega_pitch, omega_yaw]` — consensus best for sim-to-real (Swift, SimpleFlight, RAPTOR)
+- **Action space**: `[thrust, omega_roll, omega_pitch, omega_yaw]` — angular rate + thrust setpoints via PSDK joystick (often called "CTBR" in RL literature). Consensus best for sim-to-real (Swift, SimpleFlight, RAPTOR). DJI's safety arbiter (motor mixing, failsafe, authority) remains active — this is outer-loop control, not raw motor access.
 - **Observation**: 23-dim with **rotation matrix** (9 values, not quaternion) per SimpleFlight IEEE RA-L 2024
 - **Physics 200Hz / Policy 50Hz** (decimation=4)
 - **DirectRLEnv** pattern (not ManagerBasedRLEnv) — follows Isaac Lab quadcopter example
@@ -94,10 +94,11 @@ Install extras: `pip install -e ".[training]"` (Isaac Lab), `pip install -e ".[d
 
 | Term | Meaning |
 |------|---------|
-| CTBR | Collective Thrust + Body Rates — lowest-level DJI PSDK control mode, bypasses internal attitude controller |
+| Angular Rate + Thrust | PSDK's lowest-level joystick mode: `HORIZONTAL_ANGULAR_RATE` + `VERTICAL_THRUST` + `YAW_ANGLE_RATE` in body frame (FRU). Often called "CTBR" in RL literature. DJI's safety arbiter remains active — this is high-frequency outer-loop setpoint control, NOT raw motor access. |
+| DJI Safety Arbiter | Always-on DJI layer: joystick authority management (RC can reclaim on pause/low-battery/geofence/PSDK disconnect), motor mixing, ESC protection, failsafe triggers. A commercial advantage for regulatory compliance. |
 | PSDK | Payload SDK — DJI's API for on-board computers (Manifold 3) |
 | M350 RTK | DJI Matrice 350 RTK — target industrial drone platform (6.47kg, 4 rotors) |
 | Manifold 3 | DJI's on-board computer (Jetson Orin NX 16GB), runs TensorRT FP16 inference |
 | DR | Domain Randomization — mass ±15%, wind 0-12 m/s, spray 0-15 N |
 | SimpleFlight | IEEE RA-L 2024 — rotation matrix input + action smoothness penalty are key for sim-to-real |
-| Swift | Nature 2023 — champion drone racing with RL, validated CTBR action space |
+| Swift | Nature 2023 — champion drone racing with RL, validated angular-rate + thrust action space |

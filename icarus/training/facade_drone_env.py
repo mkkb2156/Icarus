@@ -5,9 +5,12 @@ wall surface while handling wind disturbances and spray recoil forces.
 
 Aligned with PLAN.md Phase 1 / ROADMAP.md Phase 1A specifications.
 
-Action Space (4-dim CTBR):
+Action Space (4-dim angular rate + thrust):
     [thrust, omega_roll, omega_pitch, omega_yaw]
     Policy outputs [-1, 1], scaled to physical units.
+    In simulation, these map directly to body-frame forces/torques.
+    At deployment, these become PSDK angular-rate + thrust setpoints
+    (DJI safety arbiter handles motor mixing and failsafe).
 
 Observation Space (23-dim):
     State (18):  lin_vel_body(3) + ang_vel_body(3) + rotation_matrix(9) + position_error(3)
@@ -17,7 +20,7 @@ Observation Space (23-dim):
 References:
     - Isaac Lab Quadcopter example (DirectRLEnv pattern)
     - SimpleFlight (IEEE RA-L 2024): rotation matrix > quaternion for sim-to-real
-    - Swift (Nature 2023): CTBR action space
+    - Swift (Nature 2023): angular rate + thrust action space
 """
 
 from __future__ import annotations
@@ -107,7 +110,7 @@ class FacadeDroneEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        """Convert 4D CTBR actions to body-frame thrust and moments.
+        """Convert 4D angular-rate + thrust actions to body-frame thrust and moments.
 
         Actions are normalized to [-1, 1] from the policy:
           actions[:, 0] → thrust (mapped to [0, max_thrust] via (a+1)/2)

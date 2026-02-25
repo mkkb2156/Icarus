@@ -27,8 +27,8 @@ def compute_facade_reward(
         distance_to_wall: Distance from drone to wall surface. Shape: (N,)
         target_distance: Desired wall distance in meters (1.5m).
         angular_velocity: Body-frame angular velocity [wx, wy, wz]. Shape: (N, 3)
-        action: Current CTBR action [thrust, wr, wp, wy]. Shape: (N, 4)
-        prev_action: Previous step CTBR action. Shape: (N, 4)
+        action: Current action [thrust, wr, wp, wy]. Shape: (N, 4)
+        prev_action: Previous step action. Shape: (N, 4)
         spray_status: Binary spray on/off. Shape: (N,)
 
     Returns:

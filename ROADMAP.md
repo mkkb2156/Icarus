@@ -19,9 +19,10 @@
 
 ### 關鍵技術發現（影響架構決策）
 
-1. **Action Space**: CTBR (Collective Thrust + Body Rates) 是 sim-to-real 成功率最高的 action space（Swift, SimpleFlight, RAPTOR 一致結論）。PSDK header `dji_flight_controller.h` 定義了 `HORIZONTAL_ANGULAR_RATE_CONTROL_MODE=3`、`VERTICAL_THRUST_CONTROL_MODE=2`、`STABLE_CONTROL_MODE_DISABLE=1`，表示 CTBR 在 PSDK 層級可用。
-   - **Action space**: `[thrust, ω_roll, ω_pitch, ω_yaw]` — 直接 body-rate + thrust 控制，繞過 DJI 內部態度控制器
-   - Phase 2 上機後第一優先驗證 M350 是否接受 CTBR 指令；若韌體拒絕再實作 velocity fallback（訓練僅需 ~4hrs）。
+1. **Action Space**: 角速率 + 推力 (Angular Rate + Thrust) 是 sim-to-real 成功率最高的 action space（Swift, SimpleFlight, RAPTOR 一致結論）。PSDK 建議模式組合：`HORIZONTAL_ANGULAR_RATE_CONTROL_MODE` + `VERTICAL_THRUST_CONTROL_MODE` + `YAW_ANGLE_RATE_CONTROL_MODE`，座標系為 `HORIZONTAL_BODY_COORDINATE`（機體座標/FRU）。
+   - **Action space**: `[thrust, ω_roll, ω_pitch, ω_yaw]` — 高頻外迴路角速率 + 推力設定點控制
+   - **重要修正**：此模式並非「繞過 DJI 內部態度控制器」。正確理解：RL 策略提供外迴路 + 半內迴路設定點，DJI 安全仲裁器（馬達混控、ESC、權限管理、失效保護）始終在線。這是商業優勢——法規合規、客戶風險保障。
+   - Phase 2 三項關鍵驗證：(a) 指令更新率 & 實際延遲（目標 20-50Hz），(b) 模式可用性限制（水霧/反射場景），(c) 權限接管邊界 & 優雅降級協議
 
 2. **觀察空間修正**: SimpleFlight 研究證實：用 **旋轉矩陣 (9 values)** 取代四元數 (4 values) 作為 actor 輸入能顯著提升 sim-to-real 成功率。PLAN.md 中的觀察向量需相應調整。
 
@@ -34,7 +35,11 @@
 
 4. **推理延遲**: 我們的 MLP `[20]→256→128→64→[4]` (~41K 參數) 在 Orin NX 上 TensorRT FP16 推理延遲約 **0.1-0.5ms**，50Hz (20ms) 預算下有 ~19ms 餘裕。Python 完全可行。
 
-5. **M350 控制層級**: 無法發送直接馬達 RPM 指令。PSDK 最低層級為 body-rate + thrust（CTBR）。PSDK header 定義了 `HORIZONTAL_ANGULAR_RATE_CONTROL_MODE` 及 `VERTICAL_THRUST_CONTROL_MODE` 枚舉，**CTBR 可能可用但需 Phase 2 實機驗證**。若可用，RL 策略可直接輸出 body-rate + thrust（繞過 DJI 內部態度控制器）；若不可用，退回 velocity + yaw rate **外迴路控制器**。
+5. **M350 控制層級**（三層模型）:
+   - **(1) AI 外迴路**：角速率 + 推力設定點（RL 策略輸出，20-50Hz+）
+   - **(2) DJI 安全仲裁器**（始終在線，不可繞過）：馬達混控、ESC 保護、Joystick 權限管理（RC 可隨時收回：暫停/低電量/地理圍欄/PSDK 斷線）、失效保護。這是商業安全特性，非技術限制。
+   - **(3) 真正內迴路**（黑盒）：馬達混控矩陣 / ESC 級控制，無任何 API 可存取，商業場景不應觸碰。
+   - PSDK header 定義了 `HORIZONTAL_ANGULAR_RATE_CONTROL_MODE` 及 `VERTICAL_THRUST_CONTROL_MODE` 枚舉，**需 Phase 2 實機驗證**可用性、指令延遲及權限接管行為。若模式被韌體拒絕，退回 velocity + yaw rate 外迴路控制器。
 
 6. **Manifold 3 軟體堆疊**: JetPack 5.1.3 / Ubuntu 20.04 / CUDA 11.4 / TensorRT 8.5。TensorRT 引擎必須在 Manifold 3 上建構。
 
@@ -464,20 +469,40 @@ torch.onnx.export(
 psdk/bridge.py          — C → Python 函數封裝
 psdk/telemetry.py       — 非同步遙測訂閱 (400Hz angular rate, 200Hz accel/attitude, 50Hz GPS)
 psdk/perception.py      — 毫米波雷達深度訂閱
-psdk/flight_controller.py — CTBR 指令介面 (body-rate + thrust)
+psdk/flight_controller.py — 角速率 + 推力指令介面 (angular rate + thrust setpoints)
 ```
 
-**🔴 Phase 2 第一優先驗證：CTBR 模式可用性**
-```
+**🔴 Phase 2 第一優先驗證：角速率 + 推力模式（三項關鍵測試）**
+
 在 Manifold 3 上執行：
-1. DjiFlightController_SetJoystickMode() 設定 CTBR 枚舉值
+
+**測試 A：指令速率 & 延遲**
+```
+1. DjiFlightController_SetJoystickMode() 設定角速率 + 推力模式
    - horizontalControlMode = ANGULAR_RATE (3)
    - verticalControlMode = THRUST (2)
-   - stableMode = DISABLE (1)
+   - yawControlMode = YAW_ANGLE_RATE (1)
+   - coordinate = BODY (FRU)
 2. 檢查回傳碼是否為 DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS
-3. 若成功 → 確認 CTBR 可用，繼續開發
-4. 若失敗 → 記錄錯誤碼，實作 velocity fallback（訓練 ~4hrs）
+3. 測量可持續指令更新率（目標：20-50Hz，最低：10-20Hz）
+4. 測量端到端延遲（PSDK 指令 → 可量測馬達響應）
 ```
+
+**測試 B：模式可用性限制**
+```
+1. 測試水霧/反射表面場景下的模式穩定性
+2. 記錄哪些 GPS/健康旗標或視覺系統狀態影響模式可用性
+3. 繪製「降級模式」場景圖
+```
+
+**測試 C：權限接管邊界**
+```
+1. 系統性觸發所有接管條件（RC 暫停、低電量、地理圍欄接近）
+2. 測量接管過渡時間
+3. 設計優雅降級協議：偵測權限喪失 → 安全懸停指令 → 權限恢復後繼續
+```
+
+若模式被韌體拒絕 → 記錄錯誤碼，實作 velocity fallback（訓練 ~4hrs）
 
 ### 2B. 多頻率感測器對齊 (1 週)
 ```
@@ -614,8 +639,10 @@ MAVLink/PX4 FlightCommandInterface 實作
 
 | 風險 | 影響 | 緩解措施 |
 |------|------|---------|
-| PSDK Virtual Stick 延遲 > 50ms | 控制頻率受限 | 測量實際延遲，調整策略步進頻率 |
-| DJI 內部態度控制器干擾 AI 指令 | 控制品質下降 | 策略在訓練中學習與內部控制器共存 |
+| PSDK Virtual Stick 延遲 > 50ms | 控制頻率受限 | Phase 2 測試 A 量測實際延遲，調整策略步進頻率 |
+| DJI 安全仲裁器介入（權限接管、低電量、地理圍欄） | 控制權暫時中斷 | 設計優雅降級協議：偵測權限喪失→安全懸停指令→權限恢復後自動接續。Phase 2 測試 C 繪製所有接管邊界。這是商業安全特性，非技術限制。 |
+| 指令更新率不足（<10Hz） | 策略表現降低、震盪增加 | Phase 2 測試 A 量測實際延遲。若 <10Hz，重新訓練以較低決策頻率匹配（降低 decimation ratio） |
+| 水霧/反射場景導致視覺系統降級 | 部分控制模式不可用 | Phase 2 測試 B 繪製降級場景。備用：切換為僅 GPS/RTK + IMU 模式，犧牲精度換取可用性 |
 | 噴水反作用力非線性超出訓練範圍 | 失控 | DR 範圍覆蓋 20N；安全層硬限制 |
 | 大樓表面複雜幾何導致深度感測異常 | 距離保持失敗 | 多感測器融合 (radar + stereo)；過期標記 |
 | Manifold 3 熱節流 (不太可能) | 推理延遲增加 | MLP 推理 < 1W，遠低於散熱能力 |

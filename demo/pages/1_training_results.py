@@ -110,7 +110,7 @@ with col2:
     | Architecture | MLP `[23]→256→128→64→[4]` |
     | Parameters | **41,156** |
     | Input | 23-dim observation (rotation matrix, not quaternion) |
-    | Output | 4-dim CTBR [thrust, ω_roll, ω_pitch, ω_yaw] |
+    | Output | 4-dim [thrust, ω_roll, ω_pitch, ω_yaw] (angular rate + thrust setpoints) |
     | Inference latency | **<1ms** (TensorRT FP16 on Jetson Orin) |
     | Training | PPO, 4096 envs, ~2-6hrs on RTX 4090 |
     | Export | PyTorch → ONNX → TensorRT |
