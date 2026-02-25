@@ -1,0 +1,5 @@
+streamlit>=1.30
+plotly>=5.18
+anthropic>=0.40
+numpy>=1.24
+Pillow>=10.0

@@ -1,0 +1,36 @@
+[project]
+name = "icarus"
+version = "0.1.0"
+description = "Embodied AI Drone Facade Operations System"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.0",
+    "onnx>=1.14",
+    "onnxruntime>=1.16",
+]
+
+[project.optional-dependencies]
+training = [
+    "isaaclab[isaacsim,all]==2.3.2",
+    "tensorboard>=2.14",
+]
+demo = [
+    "streamlit>=1.30",
+    "plotly>=5.18",
+    "anthropic>=0.40",
+]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools.packages.find]
+include = ["icarus*"]
+
+[tool.ruff]
+line-length = 120

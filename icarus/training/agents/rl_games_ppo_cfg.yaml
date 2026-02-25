@@ -1,0 +1,74 @@
+# rl_games PPO configuration for Icarus FacadeDrone environment
+# Aligned with ROADMAP.md Phase 1E training specifications
+#
+# Network: MLP [23] → 256 → 128 → 64 → [4] (~41K parameters)
+# Training: 4096 parallel envs, 5000 epochs, ~2-6 hours on RTX 4090
+#
+# Reference: Isaac Lab Quadcopter PPO config + PLAN.md hyperparameters
+
+params:
+  seed: 42
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: actor_critic
+    separate: False
+
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True
+
+    mlp:
+      units: [256, 128, 64]
+      activation: elu
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  config:
+    name: Icarus-FacadeDrone-Direct-v0
+    env_name: rlgpu
+    multi_gpu: False
+    mixed_precision: True
+    normalize_input: True
+    normalize_value: True
+    value_bootstrap: True
+
+    # Training
+    num_actors: ${....num_envs}  # 4096
+    max_epochs: 5000
+    minibatch_size: 32768
+    mini_epochs: 8
+    gamma: 0.99
+    tau: 0.95  # GAE lambda
+    learning_rate: 3.0e-4
+    lr_schedule: adaptive
+    kl_threshold: 0.008
+    e_clip: 0.2  # PPO clip ratio
+    entropy_coef: 0.01
+    truncate_grads: True
+    grad_norm: 1.0
+    horizon_length: 24
+    normalize_advantage: True
+
+    # Reward scaling
+    reward_shaper:
+      scale_value: 1.0
+
+    # Logging
+    save_best_after: 100
+    save_frequency: 500
+    print_stats: True
