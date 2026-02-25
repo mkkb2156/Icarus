@@ -58,7 +58,7 @@ class FacadeDroneEnvCfg(DirectRLEnvCfg):
 
     # --- Robot asset ---
     # Using Crazyflie as initial proxy; replace with M350 URDF/USD in Phase 2
-    robot_cfg: ArticulationCfg = ArticulationCfg(
+    robot: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(
             usd_path="${ISAACLAB_ASSETS_DIR}/Robots/Crazyflie/cf2x.usd",

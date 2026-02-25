@@ -24,12 +24,12 @@ from __future__ import annotations
 
 import math
 
+import gymnasium as gym
 import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
-from isaaclab.sim import SimulationCfg
 
 from .facade_drone_env_cfg import FacadeDroneEnvCfg
 from .reward import compute_facade_reward
@@ -48,16 +48,20 @@ class FacadeDroneEnv(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         # Cache robot properties
-        self._robot_mass = self._robot.root_physx_view.get_masses().sum(dim=-1)  # (N,)
-        self._gravity_magnitude = abs(self.sim.cfg.gravity[2])
-        self._robot_weight = self._robot_mass * self._gravity_magnitude  # (N,)
+        self._body_id = self._robot.find_bodies("body")[0]
+        self._robot_mass = self._robot.root_physx_view.get_masses()[0].sum()
+        self._gravity_magnitude = torch.tensor(self.sim.cfg.gravity, device=self.device).norm()
+        self._robot_weight = (self._robot_mass * self._gravity_magnitude).item()
 
-        # Action buffers — forces and torques applied to robot body
+        # Action buffers
+        self._actions = torch.zeros(
+            self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device
+        )
         self._thrust = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self._moment = torch.zeros(self.num_envs, 1, 3, device=self.device)
 
         # Previous action for smoothness penalty
-        self._prev_action = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+        self._prev_action = torch.zeros_like(self._actions)
 
         # Wind state (Ornstein-Uhlenbeck process)
         self._wind_velocity = torch.zeros(self.num_envs, 3, device=self.device)
@@ -79,20 +83,20 @@ class FacadeDroneEnv(DirectRLEnv):
     def _setup_scene(self):
         """Spawn robot, wall, and ground plane into the scene."""
         # Spawn robot (Crazyflie proxy — will be replaced with M350 USD)
-        self._robot = Articulation(self.cfg.robot_cfg)
+        self._robot = Articulation(self.cfg.robot)
         self.scene.articulations["robot"] = self._robot
 
-        # Spawn wall
-        self._wall = RigidObject(self.cfg.wall_cfg)
+        # Spawn wall as static rigid body
+        self._wall = RigidObject(self.cfg.wall_cfg)  # wall_cfg stays as-is (not a registered scene entity)
         self.scene.rigid_objects["wall"] = self._wall
 
-        # Ground plane
+        # Ground plane (using TerrainImporter pattern from quadcopter example)
         ground_cfg = sim_utils.GroundPlaneCfg()
         ground_cfg.func("/World/GroundPlane", ground_cfg)
 
         # Clone environments and set up collision filtering
         self.scene.clone_environments(copy_from_source=False)
-        self.scene.filter_collisions(global_prim_paths=[])
+        self.scene.filter_collisions(global_prim_paths=["/World/GroundPlane"])
 
         # Lighting
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -139,12 +143,13 @@ class FacadeDroneEnv(DirectRLEnv):
         drag_coeff = 0.5  # combined drag factor
         wind_force = drag_coeff * self._wind_velocity  # (N, 3) in world frame
 
-        # Total external force = thrust + wind + spray (all in body frame, will be rotated)
-        # Note: thrust and moment are in body frame, applied via the articulation API
-        self._robot.set_external_force_and_torque(
-            forces=self._thrust + self._spray_force + wind_force.unsqueeze(1),
+        # Apply forces via wrench composer (same pattern as quadcopter example)
+        # Thrust + spray are in body frame; wind is added as world-frame perturbation
+        total_forces = self._thrust + self._spray_force + wind_force.unsqueeze(1)
+        self._robot.permanent_wrench_composer.set_forces_and_torques(
+            body_ids=self._body_id,
+            forces=total_forces,
             torques=self._moment,
-            body_ids=[0],  # apply to root body
         )
 
     # ------------------------------------------------------------------
@@ -257,7 +262,7 @@ class FacadeDroneEnv(DirectRLEnv):
         died = crashed_wall | drifted_away | too_low | too_high
 
         # Time out
-        time_out = self.episode_length_buf >= self.max_episode_length
+        time_out = self.episode_length_buf >= self.max_episode_length - 1
 
         return died, time_out
 
@@ -265,21 +270,27 @@ class FacadeDroneEnv(DirectRLEnv):
     # Reset
     # ------------------------------------------------------------------
 
-    def _reset_idx(self, env_ids: torch.Tensor):
+    def _reset_idx(self, env_ids: torch.Tensor | None):
         """Reset specified environments."""
+        if env_ids is None or len(env_ids) == self.num_envs:
+            env_ids = self._robot._ALL_INDICES
         num_resets = len(env_ids)
-        if num_resets == 0:
-            return
 
         # Log episode metrics before reset
-        if "log" not in self.extras:
-            self.extras["log"] = {}
+        self.extras["log"] = {}
 
         for key in self._reward_components:
-            ep_lengths = self.episode_length_buf[env_ids].float()
-            avg = self._episode_sums[key][env_ids].sum() / max(num_resets, 1)
-            self.extras["log"][f"Episode_Reward/{key}"] = avg.item()
+            avg = torch.mean(self._episode_sums[key][env_ids])
+            self.extras["log"][f"Episode_Reward/{key}"] = avg.item() / self.max_episode_length_s
             self._episode_sums[key][env_ids] = 0.0
+
+        # Log termination stats
+        self.extras["log"]["Episode_Termination/died"] = torch.count_nonzero(
+            self.reset_terminated[env_ids]
+        ).item()
+        self.extras["log"]["Episode_Termination/time_out"] = torch.count_nonzero(
+            self.reset_time_outs[env_ids]
+        ).item()
 
         # Log distance metrics
         root_pos_w = self._robot.data.root_pos_w[env_ids]
@@ -287,33 +298,33 @@ class FacadeDroneEnv(DirectRLEnv):
         self.extras["log"]["Metrics/distance_to_wall_mean"] = distance_to_wall.mean().item()
         self.extras["log"]["Metrics/distance_to_wall_std"] = distance_to_wall.std().item()
 
-        # Reset robot state with noise
-        default_pos = torch.tensor(
-            self.cfg.robot_cfg.init_state.pos, device=self.device
-        ).unsqueeze(0).expand(num_resets, -1).clone()
+        # Reset robot via Isaac Lab API
+        self._robot.reset(env_ids)
+        super()._reset_idx(env_ids)
+
+        # Spread out initial episode lengths to avoid reset spikes
+        if num_resets == self.num_envs:
+            self.episode_length_buf = torch.randint_like(
+                self.episode_length_buf, high=int(self.max_episode_length)
+            )
+
+        # Reset to default state with noise
+        default_root_state = self._robot.data.default_root_state[env_ids]
 
         # Add position noise (curriculum-controlled)
         pos_noise = self.cfg.init_pos_noise * (2 * torch.rand(num_resets, 3, device=self.device) - 1)
-        default_pos += pos_noise
+        default_root_state[:, :3] += pos_noise
 
         # Ensure minimum wall distance
-        default_pos[:, 0] = default_pos[:, 0].clamp(
+        default_root_state[:, 0] = default_root_state[:, 0].clamp(
             min=self.cfg.wall_position_x + 0.5
         )
 
-        default_quat = torch.tensor(
-            self.cfg.robot_cfg.init_state.rot, device=self.device
-        ).unsqueeze(0).expand(num_resets, -1)
-
-        # Zero velocity at reset
-        zero_vel = torch.zeros(num_resets, 6, device=self.device)
-
-        self._robot.write_root_pose_to_sim(
-            torch.cat([default_pos, default_quat], dim=-1), env_ids
-        )
-        self._robot.write_root_velocity_to_sim(zero_vel, env_ids)
+        self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+        self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
 
         # Reset action buffers
+        self._actions[env_ids] = 0.0
         self._prev_action[env_ids] = 0.0
         self._wind_velocity[env_ids] = 0.0
 
@@ -324,15 +335,6 @@ class FacadeDroneEnv(DirectRLEnv):
             ).float()
         else:
             self._spray_status[env_ids] = 0.0
-
-        # Randomize mass (±15% per PLAN.md)
-        mass_scale = (
-            self.cfg.mass_scale_range[0]
-            + (self.cfg.mass_scale_range[1] - self.cfg.mass_scale_range[0])
-            * torch.rand(num_resets, device=self.device)
-        )
-        # Note: Isaac Lab handles mass randomization via EventManager in production;
-        # this is a simplified inline version for the initial demo.
 
     # ------------------------------------------------------------------
     # Wind simulation (Ornstein-Uhlenbeck process)
